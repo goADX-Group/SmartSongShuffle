@@ -10,4 +10,4 @@
 
 5-have fun
 
-## you must dowload the playlist to use!!!!
+## you must dowload songs to use!!!!
