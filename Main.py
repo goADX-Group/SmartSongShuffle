@@ -16,5 +16,5 @@ def main(playlist_folder):
 
 
 if __name__ == "__main__":
-    main("C:\\Users\\asala\\Music\\FOUUUURRRR")
+    main("path")
     
