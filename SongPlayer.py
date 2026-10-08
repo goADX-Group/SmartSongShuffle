@@ -253,10 +253,8 @@ class SongPlayer:
         try:
             new = {k: v.get() for k, v in self.setting_vars.items()}
         except tk.TclError:
-            return  # user typed garbage into a spinbox
+            return
 
-        # Merge with existing settings so keys not managed by the UI
-        # (currently "folder") survive the save.
         merged = dict(self.settings)
         merged.update(new)
         self.settings = clamp_settings(merged)
@@ -282,7 +280,6 @@ class SongPlayer:
                 self._on_setting_slider(k)
 
     def _resize_cooldown(self, new_cooldown):
-        """Resize the picker's recent deque, keeping the most recent entries."""
         if new_cooldown <= 0:
             keep = []
         else:
