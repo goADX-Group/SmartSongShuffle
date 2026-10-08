@@ -1,6 +1,5 @@
 import glob
 import io
-import json
 import os
 import queue
 import tkinter as tk
@@ -20,57 +19,15 @@ from winsdk.windows.media.playback import MediaPlayer  # type: ignore
 
 from SongDataBase import SongDataBase
 from SongPicker import SongPicker
+from AppSettings import (
+    DEFAULT_SETTINGS,
+    load_settings,
+    save_settings,
+    clamp_settings,
+)
 
 COVER_SIZE = 260
 SWIPE_DISTANCE = 60
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
-
-DEFAULT_SETTINGS = {
-    "volume":   0.5,
-    "closest":  3,
-    "cooldown": 10,
-}
-
-SETTINGS_BOUNDS = {
-    "volume":   (0.0, 1.0),
-    "closest":  (1,   50),
-    "cooldown": (0,   500),
-}
-
-
-def _clamp_settings(s):
-    out = {}
-    for k, default in DEFAULT_SETTINGS.items():
-        v = s.get(k, default)
-        lo, hi = SETTINGS_BOUNDS[k]
-        try:
-            v = int(v) if isinstance(default, int) else float(v)
-        except (TypeError, ValueError):
-            v = default
-        out[k] = max(lo, min(hi, v))
-    return out
-
-
-def _load_settings(path=SETTINGS_PATH):
-    s = dict(DEFAULT_SETTINGS)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            for k, v in loaded.items():
-                if k in DEFAULT_SETTINGS:
-                    s[k] = v
-        except Exception as e:
-            print(f"Failed to load settings ({e}); using defaults")
-    return _clamp_settings(s)
-
-
-def _save_settings(settings, path=SETTINGS_PATH):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(_clamp_settings(settings), f, indent=2, sort_keys=True)
-    except Exception as e:
-        print(f"Failed to save settings: {e}")
 
 
 def format_time(seconds):
@@ -83,7 +40,7 @@ class SongPlayer:
         self.db = db
         self.picker = picker
         self.folder = db.folder
-        self.settings = _load_settings()
+        self.settings = load_settings()
 
         # Push loaded settings into the picker straight away
         self.picker.closest = self.settings["closest"]
@@ -92,7 +49,6 @@ class SongPlayer:
         if start is None:
             start = picker.pick_start()
             if start is None:
-                # DB is empty or picker has no seed — fall back to first file
                 files = sorted(glob.glob(os.path.join(self.folder, "*.mp3")))
                 if not files:
                     raise FileNotFoundError(f"No mp3 files in {self.folder}")
@@ -118,7 +74,6 @@ class SongPlayer:
         root.geometry("460x540")
         root.resizable(False, False)
 
-        # Two stacked frames in the same cell; we tkraise whichever is active.
         container = ttk.Frame(root)
         container.pack(fill="both", expand=True)
         container.grid_rowconfigure(0, weight=1)
@@ -207,6 +162,15 @@ class SongPlayer:
             note="songs kept in the recent list and skipped as candidates",
         )
 
+        # Read-only display of the music folder
+        ttk.Label(body, text="Music folder").grid(
+            row=row, column=0, sticky="w", pady=(10, 0))
+        row += 1
+        ttk.Label(body, text=self.settings.get("folder") or "(not set)",
+                  foreground="#888", wraplength=320).grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
         btns = ttk.Frame(body)
         btns.grid(row=row, column=0, columnspan=2, pady=(24, 0), sticky="ew")
         ttk.Button(btns, text="Reset defaults",
@@ -264,18 +228,16 @@ class SongPlayer:
         v = max(0.0, min(1.0, v))
         pygame.mixer.music.set_volume(v)
         self.settings["volume"] = v
-        # Debounce the disk write so dragging doesn't hammer the file
         if self._volume_save_job is not None:
             try:
                 self.root.after_cancel(self._volume_save_job)
             except Exception:
                 pass
-        self._volume_save_job = self.root.after(
-            400, self._save_volume_deferred)
+        self._volume_save_job = self.root.after(400, self._save_volume_deferred)
 
     def _save_volume_deferred(self):
         self._volume_save_job = None
-        _save_settings(self.settings)
+        save_settings(self.settings)
 
     # ---------- View switching ----------
 
@@ -292,24 +254,29 @@ class SongPlayer:
             new = {k: v.get() for k, v in self.setting_vars.items()}
         except tk.TclError:
             return  # user typed garbage into a spinbox
-        new = _clamp_settings(new)
-        self.settings = new
-        _save_settings(self.settings)
+
+        # Merge with existing settings so keys not managed by the UI
+        # (currently "folder") survive the save.
+        merged = dict(self.settings)
+        merged.update(new)
+        self.settings = clamp_settings(merged)
+        save_settings(self.settings)
 
         pygame.mixer.music.set_volume(self.settings["volume"])
         self.picker.closest = self.settings["closest"]
         self._resize_cooldown(self.settings["cooldown"])
 
-        # Reflect the clamped values back into the UI in case they were out of range
         for k, v in self.settings.items():
-            self.setting_vars[k].set(v)
-            if k in self.setting_value_labels:
-                self._on_setting_slider(k)
+            if k in self.setting_vars:
+                self.setting_vars[k].set(v)
+                if k in self.setting_value_labels:
+                    self._on_setting_slider(k)
 
         print(f"Settings applied: {self.settings}")
 
     def _reset_settings(self):
-        for k, v in DEFAULT_SETTINGS.items():
+        for k in self.setting_vars:
+            v = DEFAULT_SETTINGS[k]
             self.setting_vars[k].set(v)
             if k in self.setting_value_labels:
                 self._on_setting_slider(k)
@@ -429,7 +396,7 @@ class SongPlayer:
             self.play()
         else:
             self.current = self.history.pop()
-            self.picker.unforget()   # un-cool the song we just left
+            self.picker.unforget()
             self.play()
 
     def toggle_pause(self):
@@ -490,9 +457,7 @@ class SongPlayer:
             except Exception:
                 pass
             self._volume_save_job = None
-        _save_settings(self.settings)
+        save_settings(self.settings)
         pygame.mixer.music.stop()
         self.smtc.is_enabled = False
         self.root.destroy()
-
-
