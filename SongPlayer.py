@@ -16,6 +16,11 @@ from winsdk.windows.media import (  # type: ignore
     SystemMediaTransportControlsButton,
 )
 from winsdk.windows.media.playback import MediaPlayer  # type: ignore
+from winsdk.windows.storage.streams import (  # type: ignore
+    DataWriter,
+    InMemoryRandomAccessStream,
+    RandomAccessStreamReference,
+)
 
 from SongDataBase import SongDataBase
 from SongPicker import SongPicker
@@ -26,7 +31,8 @@ from AppSettings import (
     clamp_settings,
 )
 
-COVER_SIZE = 260
+COVER_WIDTH  = 400
+COVER_HEIGHT = 225
 SWIPE_DISTANCE = 60
 
 
@@ -42,7 +48,6 @@ class SongPlayer:
         self.folder = db.folder
         self.settings = load_settings()
 
-        # Push loaded settings into the picker straight away
         self.picker.closest = self.settings["closest"]
         self._resize_cooldown(self.settings["cooldown"])
 
@@ -71,7 +76,7 @@ class SongPlayer:
 
         root = self.root = tk.Tk()
         root.title("Song Player")
-        root.geometry("460x540")
+        root.geometry(f"{COVER_WIDTH + 60}x{COVER_HEIGHT + 300}")
         root.resizable(False, False)
 
         container = ttk.Frame(root)
@@ -100,13 +105,17 @@ class SongPlayer:
     # ---------- Views ----------
 
     def _build_player_view(self, parent):
-        self.cover_label = tk.Label(parent, bd=0)
+        self.cover_label = tk.Label(parent, bd=0, bg="#000000")
         self.cover_label.pack(pady=(14, 6))
         self.cover_label.bind("<ButtonPress-1>", self.on_swipe_press)
         self.cover_label.bind("<ButtonRelease-1>", self.on_swipe_release)
 
         self.title_label = ttk.Label(parent, text="", font=("Segoe UI", 11))
-        self.title_label.pack(pady=(0, 6))
+        self.title_label.pack(pady=(0, 0))
+
+        self.artist_label = ttk.Label(parent, text="", font=("Segoe UI", 9),
+                                      foreground="#888")
+        self.artist_label.pack(pady=(0, 6))
 
         self.slider = ttk.Scale(parent, from_=0, to=1, orient="horizontal",
                                 length=400, takefocus=False)
@@ -162,7 +171,6 @@ class SongPlayer:
             note="songs kept in the recent list and skipped as candidates",
         )
 
-        # Read-only display of the music folder
         ttk.Label(body, text="Music folder").grid(
             row=row, column=0, sticky="w", pady=(10, 0))
         row += 1
@@ -321,21 +329,70 @@ class SongPlayer:
         elif command == "pause" and not self.paused:
             self.toggle_pause()
 
-    def update_system_info(self, path):
-        updater = self.smtc.display_updater
-        updater.type = MediaPlaybackType.MUSIC
+    def _read_tags(self, path):
+        """Return title, artist, and raw APIC cover bytes from the file."""
         title = os.path.splitext(os.path.basename(path))[0]
         artist = ""
+        cover = None
         try:
             tags = ID3(path)
             if "TIT2" in tags:
                 title = str(tags["TIT2"])
             if "TPE1" in tags:
                 artist = str(tags["TPE1"])
+            pictures = tags.getall("APIC")
+            if pictures:
+                cover = bytes(pictures[0].data)
         except Exception:
             pass
-        updater.music_properties.title = title
-        updater.music_properties.artist = artist
+        return {"title": title, "artist": artist, "cover": cover}
+
+    def _make_cover_image(self, cover_bytes):
+        """Letterbox the cover on a black COVER_WIDTH x COVER_HEIGHT canvas.
+        Image keeps native size if it fits; scaled down only if it exceeds the
+        canvas. Aspect ratio preserved. Black bars fill the rest."""
+        canvas = Image.new("RGB", (COVER_WIDTH, COVER_HEIGHT), "#000000")
+        if cover_bytes:
+            try:
+                img = Image.open(io.BytesIO(cover_bytes)).convert("RGB")
+                w, h = img.size
+                if w > COVER_WIDTH or h > COVER_HEIGHT:
+                    scale = min(COVER_WIDTH / w, COVER_HEIGHT / h)
+                    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                    img = img.resize(new_size, Image.LANCZOS)
+                    w, h = new_size
+                x = (COVER_WIDTH - w) // 2
+                y = (COVER_HEIGHT - h) // 2
+                canvas.paste(img, (x, y))
+            except Exception:
+                pass
+        return ImageTk.PhotoImage(canvas)
+
+    def _create_thumbnail_ref(self, cover_bytes):
+        """Build a RandomAccessStreamReference for SMTC from raw image bytes."""
+        if not cover_bytes:
+            return None
+        try:
+            stream = InMemoryRandomAccessStream()
+            writer = DataWriter(stream.get_output_stream_at(0))
+            writer.write_bytes(cover_bytes)
+            writer.store_async().get()
+            writer.flush_async().get()
+            writer.detach_stream()
+            stream.seek(0)
+            return RandomAccessStreamReference.create_from_stream(stream)
+        except Exception as e:
+            print(f"Thumbnail creation failed: {e}")
+            return None
+
+    def _update_system_info(self, tags, path):
+        updater = self.smtc.display_updater
+        updater.type = MediaPlaybackType.MUSIC
+        updater.music_properties.title = tags["title"]
+        updater.music_properties.artist = tags["artist"]
+        ref = self._create_thumbnail_ref(tags["cover"])
+        if ref is not None:
+            updater.thumbnail = ref
         updater.update()
 
     def set_system_status(self):
@@ -344,19 +401,6 @@ class SongPlayer:
         )
 
     # ---------- Player ----------
-
-    def load_cover(self, path):
-        try:
-            tags = ID3(path)
-            pictures = tags.getall("APIC")
-            if pictures:
-                img = Image.open(io.BytesIO(pictures[0].data)).convert("RGB")
-                img = img.resize((COVER_SIZE, COVER_SIZE))
-                return ImageTk.PhotoImage(img)
-        except Exception:
-            pass
-        placeholder = Image.new("RGB", (COVER_SIZE, COVER_SIZE), "#2b2b2b")
-        return ImageTk.PhotoImage(placeholder)
 
     def play(self, start=0.0):
         path = os.path.join(self.folder, self.current)
@@ -367,12 +411,15 @@ class SongPlayer:
         self.paused = False
         self.pause_button.config(text="⏸ Pause")
         self.slider.config(to=self.length)
-        self.title_label.config(text=self.current)
 
         if start == 0.0:
-            self.cover_img = self.load_cover(path)
+            tags = self._read_tags(path)
+            self.title_label.config(text=tags["title"])
+            self.artist_label.config(text=tags["artist"])
+            self.cover_img = self._make_cover_image(tags["cover"])
             self.cover_label.config(image=self.cover_img)
-            self.update_system_info(path)
+            self._update_system_info(tags, path)
+
         self.set_system_status()
 
     def position(self):
