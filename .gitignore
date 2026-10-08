@@ -183,5 +183,5 @@ cython_debug/
 
 
 #runtime made
-.csv
-.json
+*.csv
+*.json
