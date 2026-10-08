@@ -81,3 +81,6 @@ class SongPicker:
         names = sorted(stats.index)
         rng = random.Random(f"{self.seed}:__start__")
         return rng.choice(names)
+    
+    def previous_pick(self):
+        self.pick_counter -= 1

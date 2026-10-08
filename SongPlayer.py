@@ -442,6 +442,7 @@ class SongPlayer:
             self.current = self.history.pop()
             self.picker.unforget()
             self.play()
+            self.picker.previous_pick()  
 
     def toggle_pause(self):
         if self.paused:
