@@ -12,6 +12,17 @@ from DebugLog import get_logger
 
 log = get_logger("SongDataBase")
 
+# librosa + numba + scipy are very heavy per process (~500 MB – 1 GB RSS
+# each at import, more under JIT load).  Do NOT let ProcessPoolExecutor
+# default to os.cpu_count() on a modern machine — that can easily demand
+# 8–16 GB of RAM at once and Windows will kill the workers.
+DEFAULT_MAX_WORKERS = 2
+HARD_MAX_WORKERS = 4
+
+# If this many tasks fail in a row, stop — the pool is almost certainly
+# broken (OOM, import crash, dead worker) and continuing is pointless.
+CONSECUTIVE_FAILURE_ABORT = 10
+
 
 class SongDataBase:
     # Columns that get robust-z-scored before distance computation.
@@ -91,8 +102,26 @@ class SongDataBase:
         except Exception:
             log.exception("Failed to write CSV after cleanup")
 
+    def _resolve_worker_count(self, workers):
+        """Choose a safe worker count for a librosa/numba pool."""
+        cpu = os.cpu_count() or 2
+        if workers is None:
+            chosen = min(DEFAULT_MAX_WORKERS, max(1, cpu // 2))
+        else:
+            chosen = max(1, int(workers))
+        if chosen > HARD_MAX_WORKERS:
+            log.warning(
+                "Requested %d workers; capping to %d because each worker "
+                "imports librosa+numba and needs a lot of RAM.",
+                chosen, HARD_MAX_WORKERS,
+            )
+            chosen = HARD_MAX_WORKERS
+        log.info("CPU count=%d, using %d worker process(es)", cpu, chosen)
+        return chosen
+
     def analyze_folder(self, workers=None):
         log.info("analyze_folder starting (workers=%s)", workers)
+
         try:
             files = sorted(glob.glob(os.path.join(self.folder, "*.mp3")))
         except Exception:
@@ -110,11 +139,15 @@ class SongDataBase:
             log.info("Nothing to analyze")
             return self.df
 
+        n_workers = self._resolve_worker_count(workers)
+
         done = failed = 0
+        consecutive_failures = 0
+        aborted = False
         start = time.perf_counter()
 
         try:
-            with ProcessPoolExecutor(max_workers=workers) as ex:
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
                 log.debug("Submitting %d tasks to ProcessPoolExecutor", total)
                 futures = {ex.submit(analyze_song, f): f for f in todo}
 
@@ -124,8 +157,25 @@ class SongDataBase:
                         row = future.result()
                     except Exception:
                         failed += 1
+                        consecutive_failures += 1
                         log.exception("FAILED: %s", name)
+
+                        if consecutive_failures >= CONSECUTIVE_FAILURE_ABORT:
+                            log.critical(
+                                "%d tasks failed in a row — the worker pool "
+                                "is almost certainly broken (OOM or an "
+                                "import crash).  Aborting analysis.",
+                                consecutive_failures,
+                            )
+                            aborted = True
+                            # Cancel everything still queued, then break.
+                            for f in futures:
+                                f.cancel()
+                            break
                         continue
+
+                    # A successful task resets the failure streak.
+                    consecutive_failures = 0
 
                     try:
                         self.df.loc[name, list(row.keys())] = list(row.values())
@@ -146,8 +196,13 @@ class SongDataBase:
             raise
 
         total_time = time.perf_counter() - start
-        log.info("Finished in %.1f min: %d analyzed, %d skipped, %d failed",
-                 total_time / 60, done, skipped, failed)
+        if aborted:
+            log.error("ABORTED after %.1f min: %d analyzed, %d skipped, "
+                      "%d failed.  See log above for the first failure.",
+                      total_time / 60, done, skipped, failed)
+        else:
+            log.info("Finished in %.1f min: %d analyzed, %d skipped, %d failed",
+                     total_time / 60, done, skipped, failed)
         return self.df
 
     def get_song_stats(self, name=None):
