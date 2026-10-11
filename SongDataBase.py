@@ -8,6 +8,10 @@ from typing import Any
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
+from DebugLog import get_logger
+
+log = get_logger("SongDataBase")
+
 
 class SongDataBase:
     # Columns that get robust-z-scored before distance computation.
@@ -27,55 +31,123 @@ class SongDataBase:
     def __init__(self, folder, csv_path="songs.csv"):
         self.csv_path = csv_path
         self.folder = folder
+        log.info("SongDataBase init: folder=%s csv=%s", folder, csv_path)
+
         if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path, index_col=0)
-            missing = [c for c in self.Z_COLS
-                       if c not in df.columns and c not in self.DERIVED]
-            if missing:
-                print(f"Schema changed — {len(missing)} new columns needed: "
-                      f"{missing[:5]}{'...' if len(missing) > 5 else ''}. "
-                      f"Re-analyzing library from scratch.")
+            log.info("Loading existing CSV: %s", csv_path)
+            try:
+                df = pd.read_csv(csv_path, index_col=0)
+                log.info("CSV loaded: %d rows, %d columns", len(df), len(df.columns))
+            except Exception:
+                log.exception("Failed to read CSV — starting fresh")
+                df = pd.DataFrame()
+
+            missing_cols = [c for c in self.Z_COLS
+                            if c not in df.columns and c not in self.DERIVED]
+            if missing_cols:
+                log.warning(
+                    "Schema changed — %d new columns needed: %s%s. "
+                    "Re-analyzing library from scratch.",
+                    len(missing_cols),
+                    missing_cols[:5],
+                    "…" if len(missing_cols) > 5 else "",
+                )
                 self.df = pd.DataFrame()
             else:
                 self.df = df
-                print(f"Loaded {len(self.df)} existing songs from {csv_path}")
+                log.info("Loaded %d existing songs from %s", len(self.df), csv_path)
+                self._drop_missing_files()
         else:
             self.df = pd.DataFrame()
-            print("No existing data, starting fresh")
+            log.info("No existing data, starting fresh")
+
+    def _drop_missing_files(self):
+        """Remove CSV rows whose mp3 file no longer exists in the folder."""
+        if self.df.empty:
+            return
+        try:
+            present = {os.path.basename(p)
+                       for p in glob.glob(os.path.join(self.folder, "*.mp3"))}
+        except Exception:
+            log.exception("Could not enumerate folder; skipping cleanup")
+            return
+
+        missing = [name for name in self.df.index if name not in present]
+        if not missing:
+            log.debug("No missing files in CSV")
+            return
+
+        log.info("Removing %d song(s) from CSV that are missing from the folder",
+                 len(missing))
+        for name in missing[:10]:
+            log.debug("  missing: %s", name)
+        if len(missing) > 10:
+            log.debug("  … and %d more", len(missing) - 10)
+
+        self.df = self.df.drop(missing)
+        try:
+            self.df.to_csv(self.csv_path)
+            log.info("CSV rewritten after cleanup (%d songs remain)", len(self.df))
+        except Exception:
+            log.exception("Failed to write CSV after cleanup")
 
     def analyze_folder(self, workers=None):
-        files = sorted(glob.glob(os.path.join(self.folder, "*.mp3")))
+        log.info("analyze_folder starting (workers=%s)", workers)
+        try:
+            files = sorted(glob.glob(os.path.join(self.folder, "*.mp3")))
+        except Exception:
+            log.exception("glob failed on folder %s", self.folder)
+            raise
+
+        log.info("Found %d mp3 file(s) in %s", len(files), self.folder)
+
         todo = [f for f in files if os.path.basename(f) not in self.df.index]
         skipped = len(files) - len(todo)
         total = len(todo)
-        print(f"Found {len(files)} mp3 files, {skipped} already analyzed, {total} to do")
+        log.info("%d already analyzed, %d to do", skipped, total)
+
+        if total == 0:
+            log.info("Nothing to analyze")
+            return self.df
 
         done = failed = 0
         start = time.perf_counter()
 
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(analyze_song, f): f for f in todo}
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                log.debug("Submitting %d tasks to ProcessPoolExecutor", total)
+                futures = {ex.submit(analyze_song, f): f for f in todo}
 
-            for future in as_completed(futures):
-                name = os.path.basename(futures[future])
-                try:
-                    row = future.result()
-                except Exception as e:
-                    failed += 1
-                    print(f"FAILED: {name} -> {e}")
-                    continue
+                for future in as_completed(futures):
+                    name = os.path.basename(futures[future])
+                    try:
+                        row = future.result()
+                    except Exception:
+                        failed += 1
+                        log.exception("FAILED: %s", name)
+                        continue
 
-                self.df.loc[name, list(row.keys())] = list(row.values())
-                self.df.to_csv(self.csv_path)
-                done += 1
+                    try:
+                        self.df.loc[name, list(row.keys())] = list(row.values())
+                        self.df.to_csv(self.csv_path)
+                    except Exception:
+                        failed += 1
+                        log.exception("Failed to save row for %s", name)
+                        continue
 
-                elapsed = time.perf_counter() - start
-                remaining = (total - done - failed) * (elapsed / (done + failed))
-                print(f"[{done + failed}/{total}] Done: {name} | ETA ~{remaining / 60:.1f} min")
+                    done += 1
+                    elapsed = time.perf_counter() - start
+                    completed = done + failed
+                    remaining = (total - completed) * (elapsed / completed)
+                    log.info("[%d/%d] Done: %s | ETA ~%.1f min",
+                             completed, total, name, remaining / 60)
+        except Exception:
+            log.exception("analyze_folder: worker pool crashed")
+            raise
 
         total_time = time.perf_counter() - start
-        print(f"\nFinished in {total_time / 60:.1f} min: "
-              f"{done} analyzed, {skipped} skipped, {failed} failed")
+        log.info("Finished in %.1f min: %d analyzed, %d skipped, %d failed",
+                 total_time / 60, done, skipped, failed)
         return self.df
 
     def get_song_stats(self, name=None):

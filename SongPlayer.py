@@ -4,7 +4,7 @@ import os
 import queue
 import tkinter as tk
 from collections import deque
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 import pygame
 from mutagen.id3 import ID3
@@ -30,6 +30,9 @@ from AppSettings import (
     save_settings,
     clamp_settings,
 )
+from DebugLog import get_logger
+
+log = get_logger("SongPlayer")
 
 COVER_WIDTH  = 400
 COVER_HEIGHT = 225
@@ -48,6 +51,9 @@ class SongPlayer:
         self.folder = db.folder
         self.settings = load_settings()
 
+        log.info("SongPlayer initialising (folder=%s, %d songs)",
+                 self.folder, len(db.df))
+
         self.picker.closest = self.settings["closest"]
         self._resize_cooldown(self.settings["cooldown"])
 
@@ -56,8 +62,10 @@ class SongPlayer:
             if start is None:
                 files = sorted(glob.glob(os.path.join(self.folder, "*.mp3")))
                 if not files:
+                    log.error("No mp3 files in %s", self.folder)
                     raise FileNotFoundError(f"No mp3 files in {self.folder}")
                 start = os.path.basename(files[0])
+            log.info("Starting song: %s", start)
 
         self.current = start
         self.history = []
@@ -98,9 +106,12 @@ class SongPlayer:
         root.bind("<space>", lambda e: self.toggle_pause())
 
         root.protocol("WM_DELETE_WINDOW", self.close)
+
+        log.info("Starting playback")
         self.play()
         self.update_loop()
         root.mainloop()
+        log.info("SongPlayer window closed")
 
     # ---------- Views ----------
 
@@ -174,9 +185,17 @@ class SongPlayer:
         ttk.Label(body, text="Music folder").grid(
             row=row, column=0, sticky="w", pady=(10, 0))
         row += 1
-        ttk.Label(body, text=self.settings.get("folder") or "(not set)",
-                  foreground="#888", wraplength=320).grid(
-            row=row, column=0, columnspan=2, sticky="w")
+        self.folder_label = ttk.Label(
+            body,
+            text=self.settings.get("folder") or "(not set)",
+            foreground="#888",
+            wraplength=320,
+        )
+        self.folder_label.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Button(
+            body, text="Change folder…", command=self._change_folder,
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         row += 1
 
         btns = ttk.Frame(body)
@@ -278,7 +297,7 @@ class SongPlayer:
                 if k in self.setting_value_labels:
                     self._on_setting_slider(k)
 
-        print(f"Settings applied: {self.settings}")
+        log.info("Settings applied: %s", self.settings)
 
     def _reset_settings(self):
         for k in self.setting_vars:
@@ -293,6 +312,28 @@ class SongPlayer:
         else:
             keep = list(self.picker.recent)[-new_cooldown:]
         self.picker.recent = deque(keep, maxlen=new_cooldown)
+
+    def _change_folder(self):
+        current = self.settings.get("folder") or os.path.expanduser("~")
+        new = filedialog.askdirectory(title="Select music folder",
+                                      initialdir=current)
+        if not new:
+            return
+        new = os.path.abspath(new)
+        if new == self.settings.get("folder"):
+            return
+        log.info("Music folder changed: %s -> %s",
+                 self.settings.get("folder"), new)
+        self.settings["folder"] = new
+        save_settings(self.settings)
+        self.folder_label.config(text=new)
+        messagebox.showinfo(
+            "Music folder changed",
+            "Music folder updated.\n\n"
+            "Restart the app so the library is re-scanned. "
+            "Songs that are no longer in the folder will be removed "
+            "from the CSV, and any new songs will be analyzed.",
+        )
 
     # ---------- Windows media controls ----------
 
@@ -344,7 +385,7 @@ class SongPlayer:
             if pictures:
                 cover = bytes(pictures[0].data)
         except Exception:
-            pass
+            log.debug("Could not read ID3 tags from %s", path, exc_info=True)
         return {"title": title, "artist": artist, "cover": cover}
 
     def _make_cover_image(self, cover_bytes):
@@ -365,7 +406,7 @@ class SongPlayer:
                 y = (COVER_HEIGHT - h) // 2
                 canvas.paste(img, (x, y))
             except Exception:
-                pass
+                log.debug("Cover image failed to load", exc_info=True)
         return ImageTk.PhotoImage(canvas)
 
     def _create_thumbnail_ref(self, cover_bytes):
@@ -382,7 +423,7 @@ class SongPlayer:
             stream.seek(0)
             return RandomAccessStreamReference.create_from_stream(stream)
         except Exception as e:
-            print(f"Thumbnail creation failed: {e}")
+            log.warning("Thumbnail creation failed: %s", e)
             return None
 
     def _update_system_info(self, tags, path):
@@ -404,6 +445,7 @@ class SongPlayer:
 
     def play(self, start=0.0):
         path = os.path.join(self.folder, self.current)
+        log.debug("play(%s, start=%.2f)", path, start)
         self.length = max(MP3(path).info.length, 1.0)
         pygame.mixer.music.load(path)
         pygame.mixer.music.play(start=start)
@@ -428,9 +470,10 @@ class SongPlayer:
     def next(self):
         chosen = self.picker.pick(self.current)
         if chosen is None:
-            print("Picker found no song, replaying the current one")
+            log.warning("Picker found no song, replaying the current one")
             self.play()
             return
+        log.info("Next: %s -> %s", self.current, chosen)
         self.history.append(self.current)
         self.current = chosen
         self.play()
@@ -442,7 +485,7 @@ class SongPlayer:
             self.current = self.history.pop()
             self.picker.unforget()
             self.play()
-            self.picker.previous_pick()  
+            self.picker.previous_pick()
 
     def toggle_pause(self):
         if self.paused:
@@ -496,6 +539,7 @@ class SongPlayer:
         self.root.after(200, self.update_loop)
 
     def close(self):
+        log.info("SongPlayer closing")
         if self._volume_save_job is not None:
             try:
                 self.root.after_cancel(self._volume_save_job)
