@@ -23,8 +23,30 @@ REQUIRED = {
     "PIL": "pillow", "winsdk": "winsdk",
 }
 
+from importlib import metadata
+
+# Newer numba/llvmlite/numpy crash librosa's beat_track with an access violation.
+PINNED = {
+    "numpy": "2.2.6",
+    "scipy": "1.15.3",
+    "numba": "0.61.2",
+    "llvmlite": "0.44.0",
+}
 
 def _missing_packages():
+    # Check pinned versions via metadata BEFORE importing anything, so we
+    # never try to replace numpy/numba DLLs that are already loaded.
+    wrong = []
+    for name, ver in PINNED.items():
+        try:
+            if metadata.version(name) != ver:
+                wrong.append(f"{name}=={ver}")
+        except metadata.PackageNotFoundError:
+            wrong.append(f"{name}=={ver}")
+    if wrong:
+        log.warning("Wrong or missing pinned versions: %s", wrong)
+        return wrong
+
     out = []
     for mod, pip_name in REQUIRED.items():
         try:
