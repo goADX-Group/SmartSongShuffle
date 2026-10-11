@@ -3,9 +3,9 @@ import os
 import time
 import pandas as pd
 import glob
-import matplotlib.pyplot as plt
 from typing import Any
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 import numpy as np
 
 from DebugLog import get_logger
@@ -18,10 +18,6 @@ log = get_logger("SongDataBase")
 # 8–16 GB of RAM at once and Windows will kill the workers.
 DEFAULT_MAX_WORKERS = 2
 HARD_MAX_WORKERS = 4
-
-# If this many tasks fail in a row, stop — the pool is almost certainly
-# broken (OOM, import crash, dead worker) and continuing is pointless.
-CONSECUTIVE_FAILURE_ABORT = 10
 
 
 class SongDataBase:
@@ -119,6 +115,120 @@ class SongDataBase:
         log.info("CPU count=%d, using %d worker process(es)", cpu, chosen)
         return chosen
 
+    # ------------------------------------------------------------------
+    # Row persistence
+    # ------------------------------------------------------------------
+
+    def _store_row(self, name, row):
+        """Write one analysed song into the DataFrame and flush to CSV.
+        Returns True on success, False if writing failed."""
+        try:
+            self.df.loc[name, list(row.keys())] = list(row.values())
+            self.df.to_csv(self.csv_path)
+            return True
+        except Exception:
+            log.exception("Failed to save row for %s", name)
+            return False
+
+    # ------------------------------------------------------------------
+    # Analysis backends
+    # ------------------------------------------------------------------
+
+    def _analyze_serial(self, files, start, total, done, failed):
+        """In-process fallback (also used when workers == 1).
+
+        Runs every file in the current process, so a native crash in
+        librosa on one file will take the whole process down — but the
+        CSV is flushed after each success, so a subsequent run resumes.
+        """
+        for f in files:
+            name = os.path.basename(f)
+            try:
+                row = analyze_song(f)
+            except Exception:
+                failed += 1
+                log.exception("FAILED (serial): %s", name)
+                continue
+
+            if not self._store_row(name, row):
+                failed += 1
+                continue
+
+            done += 1
+            completed = done + failed
+            elapsed = time.perf_counter() - start
+            remaining = (total - completed) * (elapsed / max(completed, 1))
+            log.info("[%d/%d] Done: %s | ETA ~%.1f min",
+                     completed, total, name, remaining / 60)
+
+        return done, failed
+
+    def _analyze_with_pool(self, files, n_workers, start, total, done, failed):
+        """Run the pool over `files`.
+
+        Returns (done, failed, pending_files, broken).  `pending_files`
+        are the inputs that never produced a result — if the pool died
+        mid-run, the caller retries these serially.
+        """
+        finished = set()
+        broken = False
+
+        ex = ProcessPoolExecutor(max_workers=n_workers)
+        try:
+            log.debug("Submitting %d tasks to ProcessPoolExecutor", len(files))
+            futures = {ex.submit(analyze_song, f): f for f in files}
+
+            try:
+                for future in as_completed(futures):
+                    f = futures[future]
+                    name = os.path.basename(f)
+
+                    try:
+                        row = future.result()
+                    except BrokenProcessPool as e:
+                        # The pool is dead.  Every other pending future
+                        # will raise the same thing; stop iterating and
+                        # let the caller fall back to serial.
+                        log.error("Worker pool died: %s", e)
+                        broken = True
+                        break
+                    except Exception:
+                        # A single bad song.  Not fatal.
+                        failed += 1
+                        log.exception("FAILED: %s", name)
+                        finished.add(f)
+                        continue
+
+                    finished.add(f)
+
+                    if not self._store_row(name, row):
+                        failed += 1
+                        continue
+
+                    done += 1
+                    completed = done + failed
+                    elapsed = time.perf_counter() - start
+                    remaining = (total - completed) * (elapsed / max(completed, 1))
+                    log.info("[%d/%d] Done: %s | ETA ~%.1f min",
+                             completed, total, name, remaining / 60)
+            finally:
+                # Don't let still-queued tasks keep churning after a break.
+                try:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # Python < 3.9 doesn't accept cancel_futures.
+                    ex.shutdown(wait=False)
+        except Exception:
+            log.exception("Unexpected error while driving the worker pool")
+            broken = True
+
+        pending = [f for f in files if f not in finished]
+        return done, failed, pending, broken
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
     def analyze_folder(self, workers=None):
         log.info("analyze_folder starting (workers=%s)", workers)
 
@@ -140,70 +250,36 @@ class SongDataBase:
             return self.df
 
         n_workers = self._resolve_worker_count(workers)
-
-        done = failed = 0
-        consecutive_failures = 0
-        aborted = False
         start = time.perf_counter()
+        done = failed = 0
+        pending = list(todo)
 
-        try:
-            with ProcessPoolExecutor(max_workers=n_workers) as ex:
-                log.debug("Submitting %d tasks to ProcessPoolExecutor", total)
-                futures = {ex.submit(analyze_song, f): f for f in todo}
+        if n_workers > 1:
+            done, failed, pending, broken = self._analyze_with_pool(
+                pending, n_workers, start, total, done, failed,
+            )
+            if not broken:
+                pending = []
+            else:
+                log.warning(
+                    "Falling back to serial analysis for the remaining "
+                    "%d file(s). Slower, but immune to worker crashes.",
+                    len(pending),
+                )
 
-                for future in as_completed(futures):
-                    name = os.path.basename(futures[future])
-                    try:
-                        row = future.result()
-                    except Exception:
-                        failed += 1
-                        consecutive_failures += 1
-                        log.exception("FAILED: %s", name)
-
-                        if consecutive_failures >= CONSECUTIVE_FAILURE_ABORT:
-                            log.critical(
-                                "%d tasks failed in a row — the worker pool "
-                                "is almost certainly broken (OOM or an "
-                                "import crash).  Aborting analysis.",
-                                consecutive_failures,
-                            )
-                            aborted = True
-                            # Cancel everything still queued, then break.
-                            for f in futures:
-                                f.cancel()
-                            break
-                        continue
-
-                    # A successful task resets the failure streak.
-                    consecutive_failures = 0
-
-                    try:
-                        self.df.loc[name, list(row.keys())] = list(row.values())
-                        self.df.to_csv(self.csv_path)
-                    except Exception:
-                        failed += 1
-                        log.exception("Failed to save row for %s", name)
-                        continue
-
-                    done += 1
-                    elapsed = time.perf_counter() - start
-                    completed = done + failed
-                    remaining = (total - completed) * (elapsed / completed)
-                    log.info("[%d/%d] Done: %s | ETA ~%.1f min",
-                             completed, total, name, remaining / 60)
-        except Exception:
-            log.exception("analyze_folder: worker pool crashed")
-            raise
+        if pending:
+            done, failed = self._analyze_serial(
+                pending, start, total, done, failed,
+            )
 
         total_time = time.perf_counter() - start
-        if aborted:
-            log.error("ABORTED after %.1f min: %d analyzed, %d skipped, "
-                      "%d failed.  See log above for the first failure.",
-                      total_time / 60, done, skipped, failed)
-        else:
-            log.info("Finished in %.1f min: %d analyzed, %d skipped, %d failed",
-                     total_time / 60, done, skipped, failed)
+        log.info("Finished in %.1f min: %d analyzed, %d skipped, %d failed",
+                 total_time / 60, done, skipped, failed)
         return self.df
+
+    # ------------------------------------------------------------------
+    # Feature access
+    # ------------------------------------------------------------------
 
     def get_song_stats(self, name=None):
         """Return z-scored features ready for distance.
