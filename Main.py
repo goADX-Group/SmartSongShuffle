@@ -43,7 +43,6 @@ ensure_dependencies()
 
 import SongDataBase
 import SongPicker
-import SongPlayer
 from AppSettings import load_settings, save_settings
 
 
@@ -114,6 +113,10 @@ def run_setup_then_relaunch():
 
 def run_gui():
     """GUI-only phase: no console output matters, just open the player."""
+    import SongPlayer
+
+
+
     settings = load_settings()
     folder = settings.get("folder", "")
     if not folder or not os.path.isdir(folder):
