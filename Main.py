@@ -27,7 +27,7 @@ from importlib import metadata
 
 # Newer numba/llvmlite/numpy crash librosa's beat_track with an access violation.
 PINNED = {
-    "numpy": "2.2.6",
+    #"numpy": "2.2.6",
     "scipy": "1.15.3",
     "numba": "0.61.2",
     "llvmlite": "0.44.0",
@@ -68,12 +68,13 @@ def ensure_dependencies():
         subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
     except Exception:
         log.exception("pip install failed")
-        sys.exit(1)
+        #sys.exit(1)
     still = _missing_packages()
     if still:
         log.critical("Still missing after install: %s", still)
-        sys.exit(1)
-    log.info("Dependencies installed successfully")
+        #sys.exit(1)
+    else:
+        log.info("Dependencies installed successfully")
 
 
 # ---- folder resolution -----------------------------------------------------
